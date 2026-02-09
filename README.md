@@ -1,2 +1,9 @@
-# telegram-quiz-bot2
-اختبر نفسك واحصل على النتيجة
+Telegram Exam Bot
+=================
+
+بوت تيليجرام للاختبارات باستخدام الصور.
+
+الأوامر:
+/add_question
+/start_exam
+/result
