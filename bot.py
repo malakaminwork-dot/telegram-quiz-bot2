@@ -1,45 +1,47 @@
+import asyncio
+from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from aiogram.utils import executor
-
-from config import BOT_TOKEN
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 import db
+import os
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL") + WEBHOOK_PATH
+
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+app = FastAPI()
 
 user_answers = {}
 current_question = {}
 
 
-@dp.message_handler(commands=["start"])
+@dp.message(Command("start"))
 async def start(msg: types.Message):
-    await msg.answer(
-        "👋 أهلاً بك\n"
-        "/add_question ➜ للمعلم\n"
-        "/start_exam ➜ للطالب"
-    )
+    await msg.answer("👋 أهلاً بك\n/add_question\n/start_exam\n/result")
 
 
-# ====== المعلم ======
-@dp.message_handler(commands=["add_question"])
+# ===== المعلم =====
+@dp.message(Command("add_question"))
 async def add_q(msg: types.Message):
-    await msg.answer(
-        "اختر نوع السؤال:",
-        reply_markup=InlineKeyboardMarkup().add(
-            InlineKeyboardButton("✔️ صح / خطأ", callback_data="tf"),
-            InlineKeyboardButton("🔘 اختيارات", callback_data="mcq")
-        )
-    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="صح / خطأ", callback_data="tf")],
+        [InlineKeyboardButton(text="اختيارات", callback_data="mcq")]
+    ])
+    await msg.answer("اختر نوع السؤال:", reply_markup=kb)
 
 
-@dp.callback_query_handler(lambda c: c.data in ["tf", "mcq"])
+@dp.callback_query(lambda c: c.data in ["tf", "mcq"])
 async def q_type(call: types.CallbackQuery):
     current_question[call.from_user.id] = {"type": call.data}
     await call.message.answer("📷 أرسل صورة السؤال")
+    await call.answer()
 
 
-@dp.message_handler(content_types=["photo"])
+@dp.message(lambda m: m.photo)
 async def get_image(msg: types.Message):
     uid = msg.from_user.id
     if uid not in current_question:
@@ -48,14 +50,12 @@ async def get_image(msg: types.Message):
     current_question[uid]["image"] = msg.photo[-1].file_id
 
     if current_question[uid]["type"] == "tf":
-        await msg.answer("أرسل الإجابة الصحيحة: (صح / خطأ)")
+        await msg.answer("أرسل الإجابة الصحيحة (صح / خطأ)")
     else:
-        await msg.answer(
-            "أرسل الاختيارات مفصولة بفاصلة\nمثال:\nA,B,C,D"
-        )
+        await msg.answer("أرسل الاختيارات مفصولة بفاصلة")
 
 
-@dp.message_handler()
+@dp.message()
 async def save_question(msg: types.Message):
     uid = msg.from_user.id
     if uid not in current_question:
@@ -64,77 +64,77 @@ async def save_question(msg: types.Message):
     q = current_question[uid]
 
     if q["type"] == "tf":
-        db.add_question("tf", q["image"], msg.text)
+        db.add_question("tf", q["image"], msg.text.strip())
         await msg.answer("✅ تم حفظ السؤال")
         current_question.pop(uid)
+
+    elif "choices" not in q:
+        q["choices"] = [c.strip() for c in msg.text.split(",")]
+        await msg.answer("أرسل الإجابة الصحيحة")
 
     else:
-        choices = msg.text.split(",")
-        await msg.answer("أرسل الإجابة الصحيحة")
-        q["choices"] = choices
-        q["step"] = "answer"
-
-
-@dp.message_handler()
-async def save_mcq_answer(msg: types.Message):
-    uid = msg.from_user.id
-    if uid not in current_question:
-        return
-
-    q = current_question[uid]
-    if q.get("step") == "answer":
-        db.add_question("mcq", q["image"], msg.text, q["choices"])
+        db.add_question("mcq", q["image"], msg.text.strip(), q["choices"])
         await msg.answer("✅ تم حفظ السؤال")
         current_question.pop(uid)
 
 
-# ====== الطالب ======
-@dp.message_handler(commands=["start_exam"])
+# ===== الطالب =====
+@dp.message(Command("start_exam"))
 async def exam(msg: types.Message):
-    questions = db.get_questions()
-    user_answers[msg.from_user.id] = {"score": 0, "total": len(questions)}
+    qs = db.get_questions()
+    user_answers[msg.from_user.id] = {"score": 0, "total": len(qs)}
 
-    for q in questions:
+    for q in qs:
         q_id, q_type, img, correct = q
 
         if q_type == "tf":
-            kb = InlineKeyboardMarkup().add(
-                InlineKeyboardButton("صح", callback_data=f"{q_id}:صح"),
-                InlineKeyboardButton("خطأ", callback_data=f"{q_id}:خطأ")
-            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="صح", callback_data=f"{q_id}:صح"),
+                InlineKeyboardButton(text="خطأ", callback_data=f"{q_id}:خطأ")
+            ]])
         else:
-            kb = InlineKeyboardMarkup()
-            for c in db.get_choices(q_id):
-                kb.add(InlineKeyboardButton(c, callback_data=f"{q_id}:{c}"))
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=c, callback_data=f"{q_id}:{c}")]
+                for c in db.get_choices(q_id)
+            ])
 
         await bot.send_photo(msg.chat.id, img, reply_markup=kb)
 
 
-@dp.callback_query_handler(lambda c: ":" in c.data)
+@dp.callback_query(lambda c: ":" in c.data)
 async def answer(call: types.CallbackQuery):
     q_id, ans = call.data.split(":")
     q_id = int(q_id)
 
     for q in db.get_questions():
-        if q[0] == q_id:
-            if ans == q[3]:
-                user_answers[call.from_user.id]["score"] += 1
+        if q[0] == q_id and q[3] == ans:
+            user_answers[call.from_user.id]["score"] += 1
 
-    await call.answer("تم تسجيل الإجابة")
+    await call.answer("تم تسجيل الإجابة ✅")
 
 
-@dp.message_handler(commands=["result"])
+@dp.message(Command("result"))
 async def result(msg: types.Message):
     r = user_answers.get(msg.from_user.id)
     if not r:
         await msg.answer("❌ لم تدخل اختبار")
         return
-
-    await msg.answer(
-        f"📊 نتيجتك:\n"
-        f"{r['score']} / {r['total']}"
-    )
+    await msg.answer(f"📊 نتيجتك:\n{r['score']} / {r['total']}")
 
 
-if __name__ == "__main__":
-    executor.start_polling(dp)
+# ===== Webhook =====
+@app.on_event("startup")
+async def on_startup():
+    await bot.set_webhook(WEBHOOK_URL)
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await bot.delete_webhook()
+
+
+app.add_api_route(
+    WEBHOOK_PATH,
+    SimpleRequestHandler(dp, bot),
+    methods=["POST"]
+)
